@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -12,24 +13,28 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all for prototyping
-	},
-}
+const (
+	pendingTimeout = 30 * time.Second
+	copyBufSize    = 16 * 1024 // 16KB — enough headroom without wasting memory
+)
 
-// Session represents a call bridged between two users via relay.
-type Session struct {
-	UserA *websocket.Conn
-	UserB *websocket.Conn
-	mu    sync.Mutex
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
 var (
-	// pending stores users waiting for their counterpart to connect.
-	// Key is the unique session ID randomly generated during the call phase.
-	pending = make(map[string]*websocket.Conn)
+	pending = make(map[string]net.Conn)
 	mu      sync.Mutex
+
+	// Pool of copy buffers — one reused per active pipe goroutine.
+	bufPool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, copyBufSize)
+			return &b
+		},
+	}
 )
 
 func main() {
@@ -37,87 +42,76 @@ func main() {
 	flag.Parse()
 
 	http.HandleFunc("/ws", handleConnection)
-
-	log.Printf("Starting Relay Server on :%d\n", *port)
-	err := http.ListenAndServe(fmt.Sprintf(":%d", *port), nil)
-	if err != nil {
-		log.Fatal("ListenAndServe: ", err)
+	log.Printf("Relay server listening on :%d\n", *port)
+	if err := http.ListenAndServe(fmt.Sprintf(":%d", *port), nil); err != nil {
+		log.Fatal(err)
 	}
 }
 
 func handleConnection(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.URL.Query().Get("id")
 	if sessionID == "" {
-		http.Error(w, "Session ID required", http.StatusBadRequest)
+		http.Error(w, "session ID required", http.StatusBadRequest)
 		return
 	}
 
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println(err)
+		log.Println("[Relay] Upgrade error:", err)
 		return
 	}
 
-	var peer *websocket.Conn
-	var isFirst bool
+	// After the WebSocket handshake we drop down to the raw TCP connection.
+	// WebSocket frames from each client pass through as opaque bytes —
+	// the relay never needs to parse them.
+	conn := ws.UnderlyingConn()
+
+	// Disable Nagle — audio frames are small and latency matters more than throughput.
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+
+	var peer net.Conn
 
 	mu.Lock()
 	if pendingConn, exists := pending[sessionID]; exists {
-		// Second user arrived! Match them up.
 		peer = pendingConn
 		delete(pending, sessionID)
-		isFirst = false
-		log.Printf("[Relay] Session %s fully connected.", sessionID)
+		log.Printf("[Relay] Session %s fully connected", sessionID)
 	} else {
-		// First user arrived. Wait for the other.
-		pending[sessionID] = ws
-		isFirst = true
-		log.Printf("[Relay] Session %s initialized by first caller. Waiting for peer...", sessionID)
+		pending[sessionID] = conn
+		log.Printf("[Relay] Session %s waiting for peer", sessionID)
 	}
 	mu.Unlock()
 
-	// If this is the second person joining, start bi-directional forwarding.
-	if !isFirst && peer != nil {
-		go bridge(ws, peer, sessionID)
-		go bridge(peer, ws, sessionID)
+	if peer != nil {
+		go pipe(conn, peer, sessionID)
+		go pipe(peer, conn, sessionID)
 	} else {
-		// First person joins and waits. If the second person doesn't arrive soon, clean up.
+		// First peer waits; clean up if no one joins in time.
 		go func() {
-			time.Sleep(30 * time.Second)
+			time.Sleep(pendingTimeout)
 			mu.Lock()
-			if pending[sessionID] == ws {
-				log.Printf("[Relay] Session %s timed out waiting for peer.", sessionID)
+			if pending[sessionID] == conn {
+				log.Printf("[Relay] Session %s timed out", sessionID)
 				delete(pending, sessionID)
-				ws.Close()
+				conn.Close()
 			}
 			mu.Unlock()
 		}()
 	}
 }
 
-// bridge blindly forwards every message type between User A and User B until one drops.
-func bridge(src, dst *websocket.Conn, sessionID string) {
+// pipe copies raw bytes in one direction until either side closes.
+// Using raw net.Conn means zero WebSocket framing overhead in the relay.
+func pipe(src, dst net.Conn, sessionID string) {
 	defer src.Close()
 	defer dst.Close()
 
-	for {
-		msgType, r, err := src.NextReader()
-		if err != nil {
-			log.Printf("[Relay] Session %s broken. Connection closed.", sessionID)
-			return
-		}
+	buf := bufPool.Get().(*[]byte)
+	defer bufPool.Put(buf)
 
-		w, err := dst.NextWriter(msgType)
-		if err != nil {
-			return
-		}
-
-		if _, err := io.Copy(w, r); err != nil {
-			return
-		}
-
-		if err := w.Close(); err != nil {
-			return
-		}
+	if _, err := io.CopyBuffer(dst, src, *buf); err != nil {
+		log.Printf("[Relay] Session %s pipe closed: %v", sessionID, err)
 	}
 }
